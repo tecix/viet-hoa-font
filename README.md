@@ -1,4 +1,4 @@
-# viet-hoa-font
+# Việt Hóa Font
 
 <p>
   <a href="#english">🇬🇧 English</a> &nbsp;|&nbsp;
