@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Output fonts (people may want to gitignore their generated outputs)
+*-VN.ttf
+*-VN.otf
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.netrwhist
+
+# Test artifacts
+test_output/
+*.png.bak
