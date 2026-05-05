@@ -1,4 +1,4 @@
-# viet-hoa-font
+# Việt Hóa Font
 
 Công cụ Việt hoá font OTF/TTF — tự động bổ sung các ký tự tiếng Việt còn thiếu vào một font chữ Latin có sẵn, bằng cách kết hợp các glyph và dấu phụ mà font đã có (hoặc mượn từ một font donor) thành các ký tự tổ hợp như `ấ ằ ợ ử Ỡ Ự Đ`.
 
