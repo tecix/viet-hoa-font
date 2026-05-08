@@ -27,6 +27,12 @@ Usage:
 
 from __future__ import annotations
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import argparse
 import base64
 import datetime
@@ -788,7 +794,8 @@ except ImportError:
     _ANTHROPIC_OK = False
 
 try:
-    import google.generativeai as _genai  # pip install google-generativeai
+    from google import genai as _genai  # pip install google-genai
+    from google.genai import types as _genai_types
     _GEMINI_OK = True
 except ImportError:
     _GEMINI_OK = False
@@ -811,7 +818,7 @@ _PROVIDER_DEFAULT_MODEL = {
 }
 _PROVIDER_SDK = {
     "claude":      ("anthropic",            _ANTHROPIC_OK),
-    "gemini":      ("google-generativeai",  _GEMINI_OK),
+    "gemini":      ("google-genai",          _GEMINI_OK),
     "openrouter":  ("openai",               _OPENAI_OK),
 }
 
@@ -925,12 +932,14 @@ def _call_claude(image_bytes: bytes, api_key: str | None, model: str) -> dict:
 
 
 def _call_gemini(image_bytes: bytes, api_key: str | None, model: str) -> dict:
-    if api_key:
-        _genai.configure(api_key=api_key)
-    import PIL.Image
-    pil_img = PIL.Image.open(io.BytesIO(image_bytes))
-    gmodel = _genai.GenerativeModel(model)
-    response = gmodel.generate_content([_VALIDATE_PROMPT, pil_img])
+    client = _genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            _genai_types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            _VALIDATE_PROMPT,
+        ],
+    )
     return _parse_response(response.text)
 
 
