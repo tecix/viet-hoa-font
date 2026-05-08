@@ -171,6 +171,47 @@ def glyph_advance(font: TTFont, glyph_name: str) -> int:
     return 0
 
 
+def topmost_right_x(
+    font: TTFont, glyph_name: str, y_tol_frac: float = 0.12,
+) -> float | None:
+    """X-coordinate of the rightmost on-curve point in the glyph's top region.
+
+    Useful for placing side-marks (horn) on calligraphic / swash fonts
+    where the bbox right edge extends well past the actual right stem.
+    The rightmost point in the top y_tol_frac slab of the outline is a
+    much better proxy for "where the right stem ends at the top".
+    """
+    glyph_set = font.getGlyphSet()
+    if glyph_name not in glyph_set:
+        return None
+    points: list[tuple[float, float]] = []
+
+    class _Pen:
+        def moveTo(self, pt): points.append(pt)
+        def lineTo(self, pt): points.append(pt)
+        def curveTo(self, *pts): points.extend(p for p in pts if p is not None)
+        def qCurveTo(self, *pts): points.extend(p for p in pts if p is not None)
+        def closePath(self): pass
+        def endPath(self): pass
+
+    try:
+        glyph_set[glyph_name].draw(_Pen())
+    except Exception:
+        return None
+    if not points:
+        return None
+    max_y = max(p[1] for p in points)
+    min_y = min(p[1] for p in points)
+    h = max_y - min_y
+    if h <= 0:
+        return None
+    tol = h * y_tol_frac
+    top_pts = [p for p in points if p[1] >= max_y - tol]
+    if not top_pts:
+        return None
+    return max(p[0] for p in top_pts)
+
+
 def font_x_height(font: TTFont) -> float:
     """Best-effort x-height. OS/2.sxHeight if present, else bbox of 'x'."""
     if "OS/2" in font and getattr(font["OS/2"], "sxHeight", 0):
@@ -191,6 +232,24 @@ def font_cap_height(font: TTFont) -> float:
     if bb:
         return bb[3]
     return 700.0
+
+
+def measure_stroke_thickness(font: TTFont) -> float:
+    """Estimate the font's horizontal stroke weight.
+
+    The hyphen-minus glyph is essentially a thin horizontal bar — its
+    bbox height is a very good proxy for the font's horizontal stroke
+    thickness, and it's present in every font. Falls back to macron /
+    underscore, then to a fraction of x-height for fonts missing those.
+    """
+    cmap = cmap_of(font)
+    for cp in (0x002D, 0x00AF, 0x005F):  # -, ¯, _
+        if cp not in cmap:
+            continue
+        bb = glyph_bbox(font, cmap[cp])
+        if bb and bb[3] > bb[1]:
+            return bb[3] - bb[1]
+    return font_x_height(font) * 0.10
 
 
 # Combining marks that sit above the base, vs below.
@@ -305,20 +364,70 @@ def heuristic_offset(
         # top), place tightly: same baseline-ish as the previous mark,
         # then shift horizontally to one side. This matches Vietnamese
         # tone-on-circumflex/breve typography.
+        #
+        # Special case: when the base is a precomposed circumflex letter
+        # (Â/Ê/Ô/â/ê/ô), Vietnamese typography places the tone mark to
+        # the upper-right of the circumflex peak rather than centered
+        # above. Shift the mark right even though we're not in the
+        # "stacked on a mark" branch (the precomposed base hides the
+        # stack from effective_top).
+        base_cp = reverse_cm.get(base)
+        base_has_circumflex = (
+            base_cp is not None
+            and "̂" in unicodedata.normalize("NFD", chr(base_cp))
+        )
         if effective_top is not None and effective_top > bb[3] + 5:
             target_bottom = effective_top - (mb[3] - mb[1]) * 0.85
             dy = target_bottom - mb[1]
+            dx += (mb[2] - mb[0]) * 0.5
+        elif base_has_circumflex and mark_codepoint != 0x0302:
+            dy = bb[3] + mark_gap - mb[1]
             dx += (mb[2] - mb[0]) * 0.5
         else:
             dy = bb[3] + mark_gap - mb[1]
 
     elif is_side:
+        # Horn placement:
+        #   - X anchor uses `topmost_right_x()` rather than bb[2] — for
+        #     calligraphic / swash fonts the bbox right extends past the
+        #     actual right stem, so we use the rightmost on-curve point
+        #     in the glyph's top region as a stem proxy.
+        #   - Y anchor is normalised to cap-height (or x-height for the
+        #     lowercase pair) rather than the base's bbox top: round
+        #     letters like O have optical overshoot above cap-height,
+        #     so using bb[3] would put ơ's horn higher than ư's. Using
+        #     the metric height makes ư and ơ horns line up exactly.
+        #   - Overlap: 0 for O/o (horn touches the bowl edge without
+        #     overlapping into it); a small inset for U/u so the horn
+        #     sits cleanly on the right stem.
+        base_cp = reverse_cm.get(base)
+        is_u_base = base_cp in (0x0055, 0x0075)
+        is_o_base = base_cp in (0x004F, 0x006F)
+        is_upper = base_cp in (0x004F, 0x0055)
+
         horn_w = mb[2] - mb[0]
         horn_h = mb[3] - mb[1]
-        overlap = horn_w * 0.15
-        dx = bb[2] - mb[0] - overlap
-        overshoot = horn_h * 0.25
-        target_horn_top = base_top + overshoot
+
+        right_anchor = topmost_right_x(font, base)
+        if right_anchor is None:
+            right_anchor = bb[2]
+
+        if is_u_base:
+            overlap = horn_w * 0.10
+        elif is_o_base:
+            overlap = 0.0
+        else:
+            overlap = horn_w * 0.15
+        dx = right_anchor - mb[0] - overlap
+
+        # Same target horn-top y for U/u and O/o, computed from the
+        # font's metric height (cap-height or x-height) instead of the
+        # base bbox top so optical overshoot doesn't unalign them.
+        if is_u_base or is_o_base:
+            letter_h = cap_height if is_upper else x_height
+        else:
+            letter_h = base_top - base_bottom
+        target_horn_top = letter_h * 0.89 + horn_h * 0.525
         dy = target_horn_top - mb[3]
 
     elif is_below:
@@ -584,6 +693,688 @@ def import_glyph_from_donor(
 
 
 # ---------------------------------------------------------------------------
+# Đ / đ synthesis
+# ---------------------------------------------------------------------------
+
+def synthesize_dstroke(
+    font: TTFont,
+    target_cp: int,
+    is_cff: bool,
+) -> str | None:
+    """Build Đ (U+0110) or đ (U+0111) by overlaying a horizontal crossbar
+    onto the font's existing D/d outline.
+
+    Đ is not Unicode-decomposable (it's a base letter with a stroke,
+    not base + combining mark), so it can't go through compose_components.
+    Instead we copy D/d's outline into a new glyph and add a small filled
+    rectangle:
+      - Đ: crossbar through the middle of the bowl, sticking out a touch
+        past the left stem.
+      - đ: short crossbar high on the ascender, crossing the right-side
+        stem with a small overhang on either side.
+
+    Stroke thickness is inferred from the font's own hyphen-minus glyph
+    so the bar matches existing horizontal strokes. Returns the new
+    glyph name on success, or None if the source D/d isn't present.
+    """
+    if target_cp == 0x0110:
+        source_cp, base_name = 0x0044, "Dcroat"
+        is_upper = True
+    elif target_cp == 0x0111:
+        source_cp, base_name = 0x0064, "dcroat"
+        is_upper = False
+    else:
+        return None
+
+    cmap = cmap_of(font)
+    if source_cp not in cmap:
+        return None
+    source_glyph = cmap[source_cp]
+    bb = glyph_bbox(font, source_glyph)
+    if bb is None:
+        return None
+
+    bx0, _, bx1, by1 = bb
+    bw = bx1 - bx0
+    stem = measure_stroke_thickness(font)
+
+    if is_upper:
+        # Crossbar through the middle of the bowl. Slightly above visual
+        # centre because optical centring sits a touch above geometric.
+        cap_h = font_cap_height(font)
+        y_center = cap_h * 0.52
+        x_left = bx0 - stem * 0.4
+        x_right = bx0 + bw * 0.55
+    else:
+        # Short crossbar high on the ascender, biased to cross the right
+        # stem of d. The stem is approximately at the right edge of the
+        # bbox; we extend ~2.5 stem widths to the left of it.
+        x_h = font_x_height(font)
+        y_center = x_h + (by1 - x_h) * 0.62
+        x_right = bx1 + stem * 0.3
+        x_left = x_right - stem * 2.5
+
+    y_bottom = y_center - stem / 2
+    y_top = y_center + stem / 2
+
+    # Pick a unique glyph name (avoid clobbering an unrelated existing entry).
+    order = font.getGlyphOrder()
+    glyph_name = base_name
+    suffix = 0
+    while glyph_name in order:
+        suffix += 1
+        glyph_name = f"{base_name}.syn{suffix}"
+
+    advance = glyph_advance(font, source_glyph)
+    glyph_set = font.getGlyphSet()
+
+    def _draw_rect(pen) -> None:
+        # Wind the rectangle so it ADDS fill rather than punching a hole.
+        # TrueType convention: outer contours are CW. CFF/PostScript: CCW.
+        # Match the prevailing convention for the font's outline format.
+        pen.moveTo((x_left, y_bottom))
+        if is_cff:
+            pen.lineTo((x_right, y_bottom))
+            pen.lineTo((x_right, y_top))
+            pen.lineTo((x_left, y_top))
+        else:
+            pen.lineTo((x_left, y_top))
+            pen.lineTo((x_right, y_top))
+            pen.lineTo((x_right, y_bottom))
+        pen.closePath()
+
+    if is_cff:
+        pen = T2CharStringPen(advance, glyph_set)
+        glyph_set[source_glyph].draw(pen)
+        _draw_rect(pen)
+        cs = pen.getCharString()
+        cff_table = font["CFF "] if "CFF " in font else font["CFF2"]
+        top_dict = cff_table.cff.topDictIndex[0]
+        cs.private = top_dict.Private
+        char_strings = top_dict.CharStrings
+        if glyph_name in char_strings.charStrings:
+            char_strings[glyph_name] = cs
+        else:
+            char_strings.charStrings[glyph_name] = len(char_strings.charStrings)
+            char_strings.charStringsIndex.append(cs)
+        if hasattr(top_dict, "charset") and glyph_name not in top_dict.charset:
+            top_dict.charset.append(glyph_name)
+    else:
+        if "glyf" not in font:
+            return None
+        pen = TTGlyphPen(glyph_set)
+        glyph_set[source_glyph].draw(pen)
+        _draw_rect(pen)
+        font["glyf"][glyph_name] = pen.glyph()
+
+    font["hmtx"].metrics[glyph_name] = (advance, 0)
+    register_glyph_order(font, glyph_name)
+    add_to_cmap(font, target_cp, glyph_name)
+    return glyph_name
+
+
+# ---------------------------------------------------------------------------
+# Combining-mark synthesis (when the font lacks them and no donor is given)
+# ---------------------------------------------------------------------------
+
+# Adobe Glyph List names for the synthesised marks, used as the preferred
+# glyph name when not already taken in the font.
+_MARK_GLYPH_NAMES = {
+    0x0300: "gravecomb",
+    0x0301: "acutecomb",
+    0x0302: "circumflexcomb",
+    0x0303: "tildecomb",
+    0x0304: "macroncomb",
+    0x0306: "brevecomb",
+    0x0308: "dieresiscomb",
+    0x0309: "hookabovecomb",
+    0x031B: "horncomb",
+    0x0323: "dotbelowcomb",
+}
+
+
+def _add_polygon(pen, points: list[tuple[float, float]], ccw_outer: bool) -> None:
+    """Add a single closed polygonal contour with the right winding.
+
+    `points` is given in CCW order. For TrueType (CW outer) we reverse it
+    so the contour fills (rather than punches) under the non-zero winding
+    rule the same way as existing glyphs in the font.
+    """
+    if not ccw_outer:
+        points = list(reversed(points))
+    pen.moveTo(points[0])
+    for p in points[1:]:
+        pen.lineTo(p)
+    pen.closePath()
+
+
+def _add_rect(pen, x0: float, y0: float, x1: float, y1: float,
+              ccw_outer: bool) -> None:
+    _add_polygon(pen, [(x0, y0), (x1, y0), (x1, y1), (x0, y1)], ccw_outer)
+
+
+def _add_slanted_bar(
+    pen, cx: float, cy: float, length: float, thickness: float,
+    angle_deg: float, ccw_outer: bool,
+) -> None:
+    """A rectangle of `length` × `thickness` rotated by angle_deg around (cx, cy).
+
+    angle_deg is measured from the positive x-axis: 0 = horizontal,
+    90 = vertical, 60 = leaning up-right (acute), 120 = leaning up-left (grave).
+    """
+    import math
+    a = math.radians(angle_deg)
+    cos_a, sin_a = math.cos(a), math.sin(a)
+    # Half-length along the bar's long axis, half-thickness perpendicular to it.
+    hx, hy = cos_a * length / 2, sin_a * length / 2
+    px, py = -sin_a * thickness / 2, cos_a * thickness / 2
+    pts = [
+        (cx - hx - px, cy - hy - py),
+        (cx + hx - px, cy + hy - py),
+        (cx + hx + px, cy + hy + py),
+        (cx - hx + px, cy - hy + py),
+    ]
+    _add_polygon(pen, pts, ccw_outer)
+
+
+def _draw_mark_outline(pen, codepoint: int, xh: float, cap_h: float,
+                       stem: float, ccw: bool) -> None:
+    """Draw the outline for a synthesised combining mark into `pen`.
+
+    Geometry is parameterised by the font's x-height and stroke thickness
+    so the mark's weight and proportions roughly match existing glyphs.
+    The mark's vertical position in glyph space is chosen so its bbox
+    sits naturally above x-height (or below baseline for dot-below) — the
+    composition step (heuristic_offset) re-positions the mark per base
+    via a dy offset, so absolute placement here only needs to be sane.
+    """
+    rest_y = xh + stem * 0.6  # bottom of above-marks
+    cx = 0.0  # marks are centered on x = 0; advance width is 0
+
+    if codepoint == 0x0301:  # acute
+        length = xh * 0.45
+        cy = rest_y + length * 0.45
+        _add_slanted_bar(pen, cx, cy, length, stem * 0.95, 65, ccw)
+
+    elif codepoint == 0x0300:  # grave
+        length = xh * 0.45
+        cy = rest_y + length * 0.45
+        _add_slanted_bar(pen, cx, cy, length, stem * 0.95, 115, ccw)
+
+    elif codepoint == 0x0304:  # macron
+        w = xh * 0.55
+        t = stem * 0.9
+        _add_rect(pen, cx - w / 2, rest_y, cx + w / 2, rest_y + t, ccw)
+
+    elif codepoint == 0x0302:  # circumflex
+        w = xh * 0.55
+        leg_len = w * 0.62
+        leg_t = stem * 0.85
+        # Two legs meeting near the top center, forming ^.
+        # Left leg leans up-right at ~55°, right leg up-left at ~125°.
+        # Place each leg's center so the legs meet at (cx, rest_y + apex_h).
+        apex_h = leg_len * 0.85  # vertical reach of the ^
+        # Centroid of each leg:
+        import math
+        a_left = math.radians(55)
+        a_right = math.radians(125)
+        # Tip of left leg should land at apex (cx, rest_y + apex_h);
+        # base of left leg at (cx - w/2, rest_y).
+        left_tip = (cx - leg_len * math.cos(a_left) / 2,
+                    rest_y + leg_len * math.sin(a_left) / 2)
+        # Adjust: place center so base is at left edge of mark.
+        lx_center = cx - w / 2 + leg_len * math.cos(a_left) / 2
+        ly_center = rest_y + leg_len * math.sin(a_left) / 2
+        rx_center = cx + w / 2 + leg_len * math.cos(a_right) / 2
+        ry_center = rest_y + leg_len * math.sin(a_right) / 2
+        _add_slanted_bar(pen, lx_center, ly_center, leg_len, leg_t, 55, ccw)
+        _add_slanted_bar(pen, rx_center, ry_center, leg_len, leg_t, 125, ccw)
+
+    elif codepoint == 0x0306:  # breve  ⌣ (cup, opens up)
+        w = xh * 0.58
+        h = xh * 0.30
+        t = stem * 0.85
+        # Bottom horizontal bar
+        _add_rect(pen, cx - w / 2, rest_y, cx + w / 2, rest_y + t, ccw)
+        # Two short verticals at the ends, going up by h
+        _add_rect(pen, cx - w / 2, rest_y + t,
+                  cx - w / 2 + t, rest_y + h, ccw)
+        _add_rect(pen, cx + w / 2 - t, rest_y + t,
+                  cx + w / 2, rest_y + h, ccw)
+
+    elif codepoint == 0x0303:  # tilde  ~ (sine wave)
+        # Approximate with two angled bars forming an S-ish shape.
+        # Left half rises (positive slope); right half falls (negative slope).
+        # The mid-point connects them at the centre of the wave.
+        w = xh * 0.65
+        amp = xh * 0.10  # vertical amplitude (peak-to-trough / 2)
+        t = stem * 0.85
+        cy = rest_y + amp + t / 2
+        # Left bar: from (-w/2, cy - amp) to (0, cy + amp), tilted up-right.
+        seg_len = ((w / 2) ** 2 + (2 * amp) ** 2) ** 0.5
+        import math
+        # Left segment goes from (-w/2, cy - amp) to (0, cy + amp): up-right.
+        a_left_deg = math.degrees(math.atan2(2 * amp, w / 2))
+        # Right segment goes from (0, cy + amp) to (w/2, cy - amp): down-right.
+        a_right_deg = -a_left_deg
+        _add_slanted_bar(pen, -w / 4, cy, seg_len, t, a_left_deg, ccw)
+        _add_slanted_bar(pen, w / 4, cy, seg_len, t, a_right_deg, ccw)
+
+    elif codepoint == 0x0308:  # dieresis (two dots)
+        d = stem * 1.25
+        gap = stem * 1.4
+        for sign in (-1, 1):
+            x_c = cx + sign * gap
+            _add_rect(pen, x_c - d / 2, rest_y,
+                      x_c + d / 2, rest_y + d, ccw)
+
+    elif codepoint == 0x0309:  # hook above ◌̉
+        # Resembles a small ?. Vertical stroke at top, hook curling left
+        # near the bottom of the mark. Approximated with rectangles.
+        h = xh * 0.45
+        t = stem * 0.85
+        # Vertical stem (upper part)
+        stem_top = rest_y + h
+        stem_bot = rest_y + h * 0.45
+        _add_rect(pen, cx - t / 2, stem_bot,
+                  cx + t / 2, stem_top, ccw)
+        # Hook curl: a horizontal segment going left, then down — two bars.
+        hook_y = stem_bot
+        hook_h = stem_bot - rest_y
+        # Top of hook (horizontal piece going left from stem)
+        _add_rect(pen, cx - t * 2.0, hook_y,
+                  cx + t / 2, hook_y + t, ccw)
+        # Down stroke at the left end of the hook
+        _add_rect(pen, cx - t * 2.0, rest_y,
+                  cx - t * 2.0 + t, hook_y + t, ccw)
+
+    elif codepoint == 0x0323:  # dot below
+        d = stem * 1.2
+        # Place below baseline: bbox from -d*1.6 .. -d*0.4, so mb[3] < 0.
+        y_top = -stem * 0.4
+        y_bot = y_top - d
+        _add_rect(pen, cx - d / 2, y_bot, cx + d / 2, y_top, ccw)
+
+    elif codepoint == 0x031B:  # horn (side mark, upper right)
+        # Small comma/hook shape. heuristic_offset positions it so its
+        # bbox right edge sits flush with the base's right side.
+        # Draw a triangle-ish polygon for the hook.
+        hook_h = (cap_h - xh) * 0.6 + xh * 0.25
+        w = stem * 1.4
+        t = stem * 0.85
+        y0 = cap_h * 0.55
+        y1 = y0 + hook_h
+        # Polygon (CCW): bottom-left, bottom-right, top-right, top-left curl.
+        pts = [
+            (cx, y0),
+            (cx + w, y0),
+            (cx + w, y1),
+            (cx + w * 0.55, y1 + t * 0.5),
+            (cx + w * 0.15, y1 - t * 0.4),
+            (cx, y1 - t * 1.2),
+        ]
+        _add_polygon(pen, pts, ccw)
+
+
+# Spacing/standalone glyphs whose outlines can stand in for a missing
+# combining mark. The first available codepoint wins; reuse is preferred
+# over geometric synthesis because the font designer drew these shapes
+# to match the rest of the font's hand. Order each list from "best fit"
+# to "acceptable fallback".
+_MARK_SOURCE_CODEPOINTS: dict[int, list[int]] = {
+    0x0301: [0x00B4, 0x0027],          # acute       ← ´  '
+    0x0300: [0x0060],                  # grave       ← `
+    0x0302: [0x02C6, 0x005E],          # circumflex  ← ˆ  ^
+    0x0303: [0x02DC, 0x007E],          # tilde       ← ˜  ~
+    0x0304: [0x00AF],                  # macron      ← ¯
+    0x0306: [0x02D8],                  # breve       ← ˘
+    0x0308: [0x00A8],                  # dieresis    ← ¨
+    0x031B: [0x2019, 0x02BC, 0x0027],  # horn        ← ’  ʼ  '
+    0x0323: [0x002E, 0x00B7],          # dot below   ← .  ·
+    # 0x0309 (hook above) intentionally absent: no spacing equivalent in
+    # standard fonts is close enough to a Vietnamese hook above.
+}
+
+
+def derive_mark_from_existing(
+    font: TTFont, mark_cp: int, is_cff: bool,
+) -> str | None:
+    """Build a combining mark by copying a similar spacing glyph's outline.
+
+    For example, the spacing acute (U+00B4 ´) in the font has already been
+    drawn by the designer to match the font's stroke weight and style;
+    reusing its outline as the combining acute (U+0301) gives a much
+    better visual match than a geometric polygon. The composition step
+    re-positions the mark via a per-base dy offset, so absolute placement
+    of the source glyph matters only for below-marks (where we lower the
+    glyph so its bbox sits below the baseline).
+    """
+    if mark_cp not in _MARK_SOURCE_CODEPOINTS:
+        return None
+    cmap = cmap_of(font)
+    if mark_cp in cmap:
+        return cmap[mark_cp]
+
+    source_cp = next(
+        (cp for cp in _MARK_SOURCE_CODEPOINTS[mark_cp] if cp in cmap), None,
+    )
+    if source_cp is None:
+        return None
+
+    source_name = cmap[source_cp]
+    bb = glyph_bbox(font, source_name)
+    if bb is None or bb[2] <= bb[0] or bb[3] <= bb[1]:
+        return None
+
+    # Below marks: shift outline downward so its bbox top sits below the
+    # baseline. heuristic_offset's BELOW branch positions by `mb[3]`, so
+    # an unshifted period (bbox y in [0, ~100]) would be misclassified
+    # by the bbox-based branch detector and placed wrong.
+    dy = 0.0
+    if mark_cp == 0x0323:
+        stem = measure_stroke_thickness(font)
+        dy = -bb[3] - stem * 0.4
+
+    glyph_set = font.getGlyphSet()
+    advance = 0  # combining marks have zero advance width
+
+    if is_cff:
+        pen = T2CharStringPen(advance, glyph_set)
+    else:
+        if "glyf" not in font:
+            return None
+        pen = TTGlyphPen(glyph_set)
+
+    if dy != 0.0:
+        glyph_set[source_name].draw(TransformPen(pen, Offset(0, dy)))
+    else:
+        glyph_set[source_name].draw(pen)
+
+    base_name = _MARK_GLYPH_NAMES.get(mark_cp, f"uni{mark_cp:04X}")
+    order = font.getGlyphOrder()
+    glyph_name = base_name
+    suffix = 0
+    while glyph_name in order:
+        suffix += 1
+        glyph_name = f"{base_name}.der{suffix}"
+
+    if is_cff:
+        cs = pen.getCharString()
+        cff_table = font["CFF "] if "CFF " in font else font["CFF2"]
+        top_dict = cff_table.cff.topDictIndex[0]
+        cs.private = top_dict.Private
+        char_strings = top_dict.CharStrings
+        if glyph_name in char_strings.charStrings:
+            char_strings[glyph_name] = cs
+        else:
+            char_strings.charStrings[glyph_name] = len(char_strings.charStrings)
+            char_strings.charStringsIndex.append(cs)
+        if hasattr(top_dict, "charset") and glyph_name not in top_dict.charset:
+            top_dict.charset.append(glyph_name)
+    else:
+        font["glyf"][glyph_name] = pen.glyph()
+
+    font["hmtx"].metrics[glyph_name] = (advance, 0)
+    register_glyph_order(font, glyph_name)
+    add_to_cmap(font, mark_cp, glyph_name)
+    return glyph_name
+
+
+def synthesize_mark(font: TTFont, codepoint: int, is_cff: bool) -> str | None:
+    """Build a missing combining mark glyph from primitives.
+
+    Used when the target font lacks a mark required for Vietnamese
+    composition (e.g. breve, dot below, horn) and no donor is provided.
+    The mark's geometry scales to the font's x-height and stroke thickness
+    so weight roughly matches; on script/display fonts the result is
+    geometric and won't truly match the design — it's a fallback to make
+    the font functional rather than an aesthetic match.
+
+    Combining marks have zero advance width and live at fixed positions in
+    glyph space. The composition step shifts them per-base via a dy offset.
+    """
+    if codepoint not in _MARK_GLYPH_NAMES:
+        return None
+
+    cmap = cmap_of(font)
+    if codepoint in cmap:
+        return cmap[codepoint]
+
+    xh = font_x_height(font)
+    cap_h = font_cap_height(font)
+    stem = measure_stroke_thickness(font)
+
+    glyph_set = font.getGlyphSet()
+    advance = 0  # combining marks: zero advance width
+
+    # CCW outer convention for CFF/PostScript, CW for TrueType.
+    ccw = bool(is_cff)
+
+    if is_cff:
+        pen = T2CharStringPen(advance, glyph_set)
+    else:
+        if "glyf" not in font:
+            return None
+        pen = TTGlyphPen(glyph_set)
+
+    _draw_mark_outline(pen, codepoint, xh, cap_h, stem, ccw)
+
+    base_name = _MARK_GLYPH_NAMES[codepoint]
+    order = font.getGlyphOrder()
+    glyph_name = base_name
+    suffix = 0
+    while glyph_name in order:
+        suffix += 1
+        glyph_name = f"{base_name}.syn{suffix}"
+
+    if is_cff:
+        cs = pen.getCharString()
+        cff_table = font["CFF "] if "CFF " in font else font["CFF2"]
+        top_dict = cff_table.cff.topDictIndex[0]
+        cs.private = top_dict.Private
+        char_strings = top_dict.CharStrings
+        if glyph_name in char_strings.charStrings:
+            char_strings[glyph_name] = cs
+        else:
+            char_strings.charStrings[glyph_name] = len(char_strings.charStrings)
+            char_strings.charStringsIndex.append(cs)
+        if hasattr(top_dict, "charset") and glyph_name not in top_dict.charset:
+            top_dict.charset.append(glyph_name)
+    else:
+        font["glyf"][glyph_name] = pen.glyph()
+
+    font["hmtx"].metrics[glyph_name] = (advance, 0)
+    register_glyph_order(font, glyph_name)
+    add_to_cmap(font, codepoint, glyph_name)
+    return glyph_name
+
+
+def synthesize_horned_base(
+    font: TTFont, target_cp: int, is_cff: bool,
+) -> str | None:
+    """Build Ơ/ơ/Ư/ư by overlaying a horn shape onto O/o/U/u.
+
+    These four letters aren't Unicode-decomposable into base + combining
+    horn at NFC level (they ARE under NFD: U+01A0 → O + U+031B), so we
+    let `compose_components` handle the NFD path normally — provided the
+    horn mark glyph exists. This function exists for the case where neither
+    the precomposed nor the horn mark are available: we draw a horn
+    directly onto the base.
+    """
+    if target_cp == 0x01A0:
+        source_cp = 0x004F  # O
+        base_name = "Ohorn"
+    elif target_cp == 0x01A1:
+        source_cp = 0x006F  # o
+        base_name = "ohorn"
+    elif target_cp == 0x01AF:
+        source_cp = 0x0055  # U
+        base_name = "Uhorn"
+    elif target_cp == 0x01B0:
+        source_cp = 0x0075  # u
+        base_name = "uhorn"
+    else:
+        return None
+
+    cmap = cmap_of(font)
+    if source_cp not in cmap:
+        return None
+    source_glyph = cmap[source_cp]
+    bb = glyph_bbox(font, source_glyph)
+    if bb is None:
+        return None
+
+    is_upper = target_cp in (0x01A0, 0x01AF)
+    bx0, by0, bx1, by1 = bb
+    stem = measure_stroke_thickness(font)
+    cap_h = font_cap_height(font)
+    xh = font_x_height(font)
+
+    # Horn dimensions: small comma-like flick at the upper-right shoulder.
+    horn_h = (by1 - (cap_h * 0.5 if is_upper else xh * 0.5)) * 0.55
+    horn_h = max(horn_h, stem * 2.5)
+    horn_w = stem * 1.35
+    t = stem * 0.85
+
+    # Anchor: top-right of the base, with a slight overlap into the bowl
+    # so the horn looks attached rather than floating.
+    overlap = horn_w * 0.20
+    x0 = bx1 - overlap
+    y_top = by1 + horn_h * 0.18  # horn rises slightly above the base top
+    y_bot = y_top - horn_h
+
+    glyph_set = font.getGlyphSet()
+    advance = glyph_advance(font, source_glyph)
+
+    if is_cff:
+        pen = T2CharStringPen(advance, glyph_set)
+        ccw = True
+    else:
+        if "glyf" not in font:
+            return None
+        pen = TTGlyphPen(glyph_set)
+        ccw = False
+
+    glyph_set[source_glyph].draw(pen)
+
+    # Horn polygon (CCW): left edge of horn going down from bowl, curling
+    # slightly outward at the top to suggest a comma flick.
+    pts = [
+        (x0, y_bot),
+        (x0 + t, y_bot),
+        (x0 + horn_w, y_top - t * 1.0),
+        (x0 + horn_w * 0.65, y_top + t * 0.4),
+        (x0 + horn_w * 0.20, y_top - t * 0.2),
+        (x0, y_top - t * 1.4),
+    ]
+    _add_polygon(pen, pts, ccw)
+
+    order = font.getGlyphOrder()
+    glyph_name = base_name
+    suffix = 0
+    while glyph_name in order:
+        suffix += 1
+        glyph_name = f"{base_name}.syn{suffix}"
+
+    if is_cff:
+        cs = pen.getCharString()
+        cff_table = font["CFF "] if "CFF " in font else font["CFF2"]
+        top_dict = cff_table.cff.topDictIndex[0]
+        cs.private = top_dict.Private
+        char_strings = top_dict.CharStrings
+        if glyph_name in char_strings.charStrings:
+            char_strings[glyph_name] = cs
+        else:
+            char_strings.charStrings[glyph_name] = len(char_strings.charStrings)
+            char_strings.charStringsIndex.append(cs)
+        if hasattr(top_dict, "charset") and glyph_name not in top_dict.charset:
+            top_dict.charset.append(glyph_name)
+    else:
+        font["glyf"][glyph_name] = pen.glyph()
+
+    font["hmtx"].metrics[glyph_name] = (advance, 0)
+    register_glyph_order(font, glyph_name)
+    add_to_cmap(font, target_cp, glyph_name)
+    return glyph_name
+
+
+# ---------------------------------------------------------------------------
+# Diacritic-stack-root re-composition
+# ---------------------------------------------------------------------------
+
+# Native precomposed letters whose Vietnamese tone-stacked descendants
+# (e.g. Ấ, ế, Ố, Ằ) are built on top of them. Each entry: (target,
+# bare_base, mark). When the mark was newly added (not native to the
+# source font), the font's native precomposed target may have been drawn
+# with a different mark glyph than the one we now use for descendants —
+# overwriting the target with a fresh composition keeps Ô consistent
+# with Ố (= Ô + acute) and Ă consistent with Ằ (= Ă + grave), etc.
+_DIACRITIC_STACK_ROOTS: list[tuple[int, int, int]] = [
+    (0x00C2, 0x0041, 0x0302),  # Â = A + circumflex
+    (0x00E2, 0x0061, 0x0302),  # â
+    (0x00CA, 0x0045, 0x0302),  # Ê
+    (0x00EA, 0x0065, 0x0302),  # ê
+    (0x00D4, 0x004F, 0x0302),  # Ô
+    (0x00F4, 0x006F, 0x0302),  # ô
+    (0x0102, 0x0041, 0x0306),  # Ă = A + breve
+    (0x0103, 0x0061, 0x0306),  # ă
+]
+
+
+def recompose_stack_roots(
+    font: TTFont,
+    newly_added_marks: set[int],
+    base_anchors: dict,
+    mark_anchors: dict,
+    cap_height: float,
+    x_height: float,
+    mark_gap: float,
+    is_cff: bool,
+    composition_map: dict[str, list[tuple[str, float, float]]],
+) -> list[int]:
+    """Overwrite native Â/â/Ê/ê/Ô/ô/Ă/ă with our own composition when the
+    relevant mark was newly added. See _DIACRITIC_STACK_ROOTS for why.
+
+    Returns the list of recomposed codepoints.
+    """
+    recomposed: list[int] = []
+    cmap = cmap_of(font)
+    reverse_cm = reverse_cmap(font)
+    for target_cp, base_cp, mark_cp in _DIACRITIC_STACK_ROOTS:
+        if mark_cp not in newly_added_marks:
+            continue
+        if base_cp not in cmap or mark_cp not in cmap:
+            continue
+        base_glyph = cmap[base_cp]
+        mark_glyph = cmap[mark_cp]
+
+        dx = dy = None
+        if base_glyph in base_anchors and mark_glyph in mark_anchors:
+            mclass, (mx, my) = mark_anchors[mark_glyph]
+            if mclass in base_anchors[base_glyph]:
+                bx, by = base_anchors[base_glyph][mclass]
+                dx, dy = bx - mx, by - my
+        if dx is None:
+            dx, dy = heuristic_offset(
+                font, base_glyph, mark_glyph, mark_cp,
+                cap_height, x_height, mark_gap, None, reverse_cm,
+            )
+
+        components = [(base_glyph, 0.0, 0.0), (mark_glyph, dx, dy)]
+        adv = glyph_advance(font, base_glyph)
+        glyph_name = f"uni{target_cp:04X}"
+        if is_cff:
+            add_composite_glyph_cff(font, glyph_name, components, adv)
+        else:
+            add_composite_glyph_truetype(font, glyph_name, components, adv)
+        register_glyph_order(font, glyph_name)
+        add_to_cmap(font, target_cp, glyph_name)
+        composition_map[glyph_name] = components
+        recomposed.append(target_cp)
+    return recomposed
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -670,25 +1461,79 @@ def vietnamize(
             file=sys.stderr,
         )
 
-    # Pre-pass: if a donor is provided, import the missing combining
-    # marks plus Đ/đ. We deliberately do NOT import other precomposed
-    # bases (Ơ, Ư, Ă, Â, Ê, Ô) from the donor: those are full letter
-    # outlines designed to match the donor's style and metrics, and
-    # dropping them into a different font produces visually inconsistent
-    # results. We compose them ourselves from the target font's own base
-    # + the imported mark. Đ/đ is special — Unicode does not decompose
-    # it (it's a base letter with a stroke, not a base + combining mark)
-    # so the donor outline is the only option.
-    if donor is not None:
-        mark_prerequisites = [
-            0x0300, 0x0301, 0x0302, 0x0303, 0x0306, 0x0309, 0x031B, 0x0323,
-            0x0110, 0x0111,  # Đ đ — not decomposable, must come from donor
-        ]
-        for cp in mark_prerequisites:
+    # Pre-pass: ensure the combining marks Vietnamese composition relies on
+    # are present in the font. Order of preference per missing mark:
+    #   1. donor font (if provided) — outlines match a real designer's hand
+    #   2. derive from an existing similar glyph in the source font itself
+    #      (e.g. spacing acute U+00B4 → combining acute U+0301, right
+    #      single quote U+2019 → horn U+031B). The shape was drawn by the
+    #      font's designer, so it stays in style.
+    #   3. synthesise from primitives — geometric shapes scaled to the
+    #      font's stroke weight and x-height. Quality is "functional, not
+    #      pretty" — script/display fonts will look mismatched, but the
+    #      result is enough to compose every Vietnamese precomposed glyph.
+    # We deliberately do NOT import precomposed bases (Ơ, Ư, Ă, Â, Ê, Ô)
+    # from the donor: those are full letter outlines whose metrics belong
+    # to the donor's design. We compose them from the target's own base
+    # + the imported / derived / synthesised mark for visual consistency.
+    mark_prerequisites = [
+        0x0300, 0x0301, 0x0302, 0x0303, 0x0306, 0x0309, 0x031B, 0x0323,
+    ]
+    synthesized_marks: set[int] = set()
+    newly_added_marks: set[int] = set()  # marks NOT native to the source font
+    for cp in mark_prerequisites:
+        if cp in cmap_of(font):
+            continue
+        if donor is not None and import_glyph_from_donor(font, donor, cp):
+            imported.append(cp)
+            newly_added_marks.add(cp)
+            continue
+        if derive_mark_from_existing(font, cp, is_cff):
+            composed.append(cp)
+            newly_added_marks.add(cp)
+            continue
+        if synthesize_mark(font, cp, is_cff):
+            composed.append(cp)
+            synthesized_marks.add(cp)
+            newly_added_marks.add(cp)
+
+    # Đ/đ are base letters with a stroke, not Unicode-decomposable.
+    # Prefer donor when one is provided (consistent with the rest of the
+    # donor's contributions). Otherwise synthesize by drawing a crossbar
+    # onto the font's own D/d outline so the result stays style-matched.
+    for cp in (0x0110, 0x0111):
+        if cp in cmap_of(font):
+            continue
+        if donor is not None and import_glyph_from_donor(font, donor, cp):
+            imported.append(cp)
+            continue
+        if synthesize_dstroke(font, cp, is_cff):
+            composed.append(cp)
+
+    # Ơ/ơ/Ư/ư: only fall back to direct horn-on-base synthesis when the
+    # horn mark itself had to be drawn from primitives. When the horn is
+    # natural (font / donor / derived from a real apostrophe), composing
+    # via the regular pipeline + heuristic_offset produces a designer-
+    # drawn horn shape attached at a sensible position — and that's
+    # better than overwriting with a geometric polygon.
+    if 0x031B in synthesized_marks or 0x031B not in cmap_of(font):
+        for cp in (0x01A0, 0x01A1, 0x01AF, 0x01B0):
             if cp in cmap_of(font):
                 continue
-            if import_glyph_from_donor(font, donor, cp):
-                imported.append(cp)
+            if synthesize_horned_base(font, cp, is_cff):
+                composed.append(cp)
+
+    # When a mark was newly added (derived/synthesised), the font's
+    # native Â/Ê/Ô/Ă (and lowercase) may use a different glyph for that
+    # mark than the one we just installed — making Vietnamese stacks like
+    # Ố (= Ô + acute) look inconsistent with the bare Ô. Re-compose the
+    # native targets so they share our mark glyph.
+    composed.extend(
+        recompose_stack_roots(
+            font, newly_added_marks, base_anchors, mark_anchors,
+            cap_height, x_height, mark_gap, is_cff, composition_map,
+        )
+    )
 
     # We may need to compose codepoints in passes — Ớ depends on Ơ — so
     # iterate until no progress is made. Order matters: simple two-piece
@@ -1132,6 +1977,97 @@ def run_validation_loop(
     return font, final_quality
 
 
+# ---------------------------------------------------------------------------
+# Sample image generation (optional — requires pillow)
+# ---------------------------------------------------------------------------
+
+_PANGRAMS = [
+    "Đầu cuối trường, mở quặng phễng.",
+    "Trăm năm trong cõi người ta, chữ tài chữ phận khéo là ghét nhau",
+    "Do bạch kim rất quý nên sẽ dùng để lắp vô xương",
+]
+
+
+def generate_sample_image(
+    font_path: Path,
+    output_path: Path,
+    *,
+    grid_font_size: int = 48,
+    text_font_size: int = 40,
+) -> None:
+    COLS = 16
+    cell = grid_font_size
+    pad = 10
+    label_h = 14
+    margin = 32
+    section_gap = 20
+
+    cw = cell + pad
+    ch = cell + pad + label_h
+    n_rows = (len(VIETNAMESE_CODEPOINTS) + COLS - 1) // COLS
+
+    try:
+        char_font = _PILFont.truetype(str(font_path), grid_font_size)
+        para_font = _PILFont.truetype(str(font_path), text_font_size)
+    except Exception as exc:
+        raise RuntimeError(f"Cannot load font for rendering: {exc}") from exc
+    label_font = _PILFont.load_default()
+
+    _scratch = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    pangram_widths = [
+        _scratch.textbbox((0, 0), p, font=para_font)[2] for p in _PANGRAMS
+    ]
+
+    content_w = max(COLS * cw, max(pangram_widths, default=0))
+    img_w = content_w + 2 * margin
+
+    section_h = 14 + section_gap // 2
+    title_h = text_font_size + section_gap
+    grid_h = n_rows * ch + section_gap
+    para_line_h = text_font_size + section_gap // 2
+    img_h = (margin + title_h + section_h + len(_PANGRAMS) * para_line_h
+             + section_gap // 2 + section_h + grid_h + margin)
+
+    img = Image.new("RGB", (img_w, img_h), "white")
+    draw = ImageDraw.Draw(img)
+
+    try:
+        _tf = TTFont(str(font_path))
+        rec = _tf["name"].getName(4, 3, 1, 0x0409) or _tf["name"].getName(1, 3, 1, 0x0409)
+        font_title = rec.toUnicode() if rec else font_path.stem
+        _tf.close()
+    except Exception:
+        font_title = font_path.stem
+
+    y = margin
+    draw.text((margin, y), font_title, fill="#111", font=para_font)
+    y += title_h
+
+    draw.text((margin, y), "Pangrams", fill="#888", font=label_font)
+    y += section_h
+
+    for pangram in _PANGRAMS:
+        draw.text((margin, y), pangram, fill="#111", font=para_font)
+        y += para_line_h
+
+    y += section_gap // 2
+
+    draw.text((margin, y), "Vietnamese Characters", fill="#888", font=label_font)
+    y += section_h
+
+    for i, cp in enumerate(VIETNAMESE_CODEPOINTS):
+        col, row = i % COLS, i // COLS
+        x = margin + col * cw + pad // 2
+        gy = y + row * ch + pad // 2
+        try:
+            draw.text((x, gy), chr(cp), fill="#111", font=char_font)
+        except Exception:
+            draw.text((x, gy), "?", fill="#c00", font=char_font)
+        draw.text((x, gy + cell + 2), f"U+{cp:04X}", fill="#bbb", font=label_font)
+
+    img.save(str(output_path))
+
+
 def check_coverage(input_path: Path) -> None:
     font = TTFont(str(input_path))
     missing = missing_codepoints(font, VIETNAMESE_CODEPOINTS)
@@ -1223,6 +2159,10 @@ def main() -> int:
     if result["validation_quality"] is not None:
         print(f"Validation quality: {result['validation_quality']}")
     print(f"Wrote {args.output}")
+    if _PIL_OK:
+        sample_path = args.output.with_suffix(".png")
+        generate_sample_image(args.output, sample_path)
+        print(f"Sample image: {sample_path}")
     return 0
 
 
