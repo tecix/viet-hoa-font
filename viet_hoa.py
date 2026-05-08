@@ -28,6 +28,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import datetime
+import io
+import json as _json
+import os
 import sys
 import unicodedata
 from pathlib import Path
@@ -478,7 +483,15 @@ def add_composite_glyph_cff(
     cff_table = font["CFF "] if "CFF " in font else font["CFF2"]
     top_dict = cff_table.cff.topDictIndex[0]
     char_strings = top_dict.CharStrings
-    char_strings[glyph_name] = charstring
+    # charstrings need a reference to the Private dict for width encoding
+    charstring.private = top_dict.Private
+    if glyph_name in char_strings.charStrings:
+        char_strings[glyph_name] = charstring
+    else:
+        # New glyph: __setitem__ requires pre-existing registration, so we
+        # insert directly into the internal name→index dict and index list.
+        char_strings.charStrings[glyph_name] = len(char_strings.charStrings)
+        char_strings.charStringsIndex.append(charstring)
 
     # Register glyph in CFF charset / private dict ordering.
     if hasattr(top_dict, "charset") and glyph_name not in top_dict.charset:
@@ -540,8 +553,14 @@ def import_glyph_from_donor(
         cs = pen.getCharString()
         cff_table = target["CFF "] if "CFF " in target else target["CFF2"]
         top_dict = cff_table.cff.topDictIndex[0]
-        top_dict.CharStrings[new_name] = cs
-        if hasattr(top_dict, "charset"):
+        cs.private = top_dict.Private
+        char_strings = top_dict.CharStrings
+        if new_name in char_strings.charStrings:
+            char_strings[new_name] = cs
+        else:
+            char_strings.charStrings[new_name] = len(char_strings.charStrings)
+            char_strings.charStringsIndex.append(cs)
+        if hasattr(top_dict, "charset") and new_name not in top_dict.charset:
             top_dict.charset.append(new_name)
     else:
         # Need TrueType outlines on both sides; if donor is CFF we'd have
@@ -562,10 +581,53 @@ def import_glyph_from_donor(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def rename_font(font: TTFont, new_family: str) -> None:
+    """Update the font's name table so it doesn't conflict with the source font."""
+    name_table = font["name"]
+    # Derive a PostScript-safe name (no spaces/special chars).
+    ps_name = "".join(c for c in new_family if c.isalnum() or c in "-_")
+
+    for record in name_table.names:
+        if record.nameID == 1:   # Family name
+            record.string = new_family
+        elif record.nameID == 3: # Unique identifier
+            try:
+                current = record.toUnicode()
+            except Exception:
+                current = ""
+            record.string = f"{ps_name}:{current}".encode(record.getEncoding())
+        elif record.nameID == 4: # Full name
+            try:
+                subfam = name_table.getName(2, record.platformID,
+                                            record.platEncID, record.langID)
+                subfam_str = subfam.toUnicode() if subfam else "Regular"
+            except Exception:
+                subfam_str = "Regular"
+            full = f"{new_family} {subfam_str}" if subfam_str != "Regular" else new_family
+            record.string = full
+        elif record.nameID == 6: # PostScript name
+            try:
+                subfam = name_table.getName(2, record.platformID,
+                                            record.platEncID, record.langID)
+                subfam_str = subfam.toUnicode() if subfam else "Regular"
+            except Exception:
+                subfam_str = "Regular"
+            # PostScript names use hyphen-separated style
+            ps = ps_name if subfam_str == "Regular" else f"{ps_name}-{subfam_str}"
+            record.string = ps
+
+
 def vietnamize(
     input_path: Path,
     output_path: Path,
     donor_path: Path | None = None,
+    font_name: str | None = None,
+    validate: bool = False,
+    validate_provider: str = "claude",
+    api_key: str | None = None,
+    validate_model: str | None = None,
+    max_iterations: int = 3,
+    log_path: Path | None = None,
     verbose: bool = False,
 ) -> dict:
     font = TTFont(str(input_path))
@@ -588,6 +650,7 @@ def vietnamize(
     composed: list[int] = []
     imported: list[int] = []
     failed: list[int] = []
+    composition_map: dict[str, list[tuple[str, float, float]]] = {}
 
     is_cff = font_is_cff(font)
 
@@ -653,6 +716,7 @@ def vietnamize(
                 add_composite_glyph_truetype(font, glyph_name, comps, adv)
             register_glyph_order(font, glyph_name)
             add_to_cmap(font, cp, glyph_name)
+            composition_map[glyph_name] = comps
             composed.append(cp)
             progress = True
         remaining = next_round
@@ -678,6 +742,24 @@ def vietnamize(
         if hasattr(os2, "ulCodePageRange1"):
             os2.ulCodePageRange1 |= (1 << 8)
 
+    validation_quality = None
+    if validate and composed:
+        effective_log = log_path or output_path.with_name(
+            output_path.stem + "_viet_hoa_validate.jsonl"
+        )
+        effective_model = validate_model or _PROVIDER_DEFAULT_MODEL.get(
+            validate_provider, "claude-opus-4-7"
+        )
+        font, validation_quality = run_validation_loop(
+            font, composition_map, composed,
+            input_path, output_path,
+            validate_provider, api_key, effective_model, max_iterations,
+            effective_log, is_cff, verbose,
+        )
+
+    if font_name:
+        rename_font(font, font_name)
+
     font.save(str(output_path))
 
     return {
@@ -685,7 +767,360 @@ def vietnamize(
         "imported": imported,
         "failed": failed,
         "total_target": len(VIETNAMESE_CODEPOINTS),
+        "validation_quality": validation_quality,
     }
+
+
+# ---------------------------------------------------------------------------
+# AI validation (optional — requires pillow + at least one provider SDK)
+# ---------------------------------------------------------------------------
+
+try:
+    from PIL import Image, ImageDraw, ImageFont as _PILFont
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
+
+try:
+    import anthropic as _anthropic
+    _ANTHROPIC_OK = True
+except ImportError:
+    _ANTHROPIC_OK = False
+
+try:
+    import google.generativeai as _genai  # pip install google-generativeai
+    _GEMINI_OK = True
+except ImportError:
+    _GEMINI_OK = False
+
+try:
+    import openai as _openai              # pip install openai  (used for OpenRouter)
+    _OPENAI_OK = True
+except ImportError:
+    _OPENAI_OK = False
+
+_PROVIDER_ENV = {
+    "claude":      "ANTHROPIC_API_KEY",
+    "gemini":      "GEMINI_API_KEY",
+    "openrouter":  "OPENROUTER_API_KEY",
+}
+_PROVIDER_DEFAULT_MODEL = {
+    "claude":      "claude-opus-4-7",
+    "gemini":      "gemini-2.0-flash",
+    "openrouter":  "google/gemini-2.0-flash-001",
+}
+_PROVIDER_SDK = {
+    "claude":      ("anthropic",            _ANTHROPIC_OK),
+    "gemini":      ("google-generativeai",  _GEMINI_OK),
+    "openrouter":  ("openai",               _OPENAI_OK),
+}
+
+
+_VALIDATE_PROMPT = """\
+You are a Vietnamese typography expert. The image shows Vietnamese characters \
+rendered from a font, each labelled with its Unicode codepoint.
+
+Identify positioning problems such as:
+• Diacritical marks overlapping each other (e.g. circumflex colliding with tone mark)
+• Excessive gap between the base letter and its mark (mark floats too high)
+• Mark touching or clashing with the base letter
+• Mark not horizontally centred over its base
+• Dot-below not properly positioned
+
+Return ONLY valid JSON (no markdown fences):
+{
+  "overall_quality": "good" | "fair" | "poor",
+  "issues": [
+    {
+      "char": "<character>",
+      "codepoint": "U+XXXX",
+      "issue": "<concise description>",
+      "severity": "low" | "medium" | "high",
+      "mark_index": <1-based index of the problematic mark>,
+      "adjustment": {
+        "direction": "up" | "down" | "left" | "right",
+        "magnitude": "small" | "medium" | "large"
+      }
+    }
+  ],
+  "notes": "<general observations>"
+}
+
+If there are no issues, return an empty issues list.\
+"""
+
+_MAGNITUDE = {"small": 20, "medium": 50, "large": 100}
+
+
+def _require_validate_deps(provider: str) -> None:
+    missing = []
+    if not _PIL_OK:
+        missing.append("pillow")
+    sdk_pkg, sdk_ok = _PROVIDER_SDK.get(provider, ("unknown", False))
+    if not sdk_ok:
+        missing.append(sdk_pkg)
+    if missing:
+        raise SystemExit(
+            f"error: --validate --provider {provider} requires: "
+            f"pip install {' '.join(missing)}"
+        )
+
+
+def _render_chars(font_path: Path, codepoints: list[int], cell: int = 80) -> bytes:
+    """Return a PNG (bytes) with all codepoints rendered in a grid."""
+    cols = 8
+    rows = (len(codepoints) + cols - 1) // cols
+    pad = 14
+    label_h = 16
+    cw, ch = cell + pad, cell + pad + label_h
+    img = Image.new("RGB", (cols * cw, rows * ch), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        pfont = _PILFont.truetype(str(font_path), cell)
+    except Exception as exc:
+        raise RuntimeError(f"Cannot load font for rendering: {exc}") from exc
+    lfont = _PILFont.load_default()
+    for i, cp in enumerate(codepoints):
+        col, row = i % cols, i // cols
+        x, y = col * cw + pad // 2, row * ch + pad // 2
+        try:
+            draw.text((x, y), chr(cp), fill="black", font=pfont)
+        except Exception:
+            draw.text((x, y), "?", fill="red", font=pfont)
+        draw.text((x, y + cell + 2), f"U+{cp:04X}", fill="#888", font=lfont)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _parse_response(raw: str) -> dict:
+    """Strip markdown fences and parse JSON from a model response."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    try:
+        return _json.loads(raw)
+    except _json.JSONDecodeError:
+        return {"overall_quality": "unknown", "issues": [],
+                "notes": "Failed to parse model response as JSON.", "raw": raw}
+
+
+def _call_claude(image_bytes: bytes, api_key: str | None, model: str) -> dict:
+    client = _anthropic.Anthropic(api_key=api_key)
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    msg = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                {"type": "text", "text": _VALIDATE_PROMPT},
+            ],
+        }],
+    )
+    return _parse_response(msg.content[0].text)
+
+
+def _call_gemini(image_bytes: bytes, api_key: str | None, model: str) -> dict:
+    if api_key:
+        _genai.configure(api_key=api_key)
+    import PIL.Image
+    pil_img = PIL.Image.open(io.BytesIO(image_bytes))
+    gmodel = _genai.GenerativeModel(model)
+    response = gmodel.generate_content([_VALIDATE_PROMPT, pil_img])
+    return _parse_response(response.text)
+
+
+def _call_openrouter(image_bytes: bytes, api_key: str | None, model: str) -> dict:
+    client = _openai.OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    resp = client.chat.completions.create(
+        model=model,
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                {"type": "text", "text": _VALIDATE_PROMPT},
+            ],
+        }],
+    )
+    return _parse_response(resp.choices[0].message.content or "")
+
+
+def _call_provider(provider: str, image_bytes: bytes,
+                   api_key: str | None, model: str) -> dict:
+    if provider == "claude":
+        return _call_claude(image_bytes, api_key, model)
+    if provider == "gemini":
+        return _call_gemini(image_bytes, api_key, model)
+    if provider == "openrouter":
+        return _call_openrouter(image_bytes, api_key, model)
+    raise ValueError(f"Unknown provider: {provider!r}")
+
+
+def _shift_tt_component(font: TTFont, glyph_name: str,
+                         mark_idx: int, ddx: int, ddy: int) -> bool:
+    """Move component mark_idx (1-based) in a TrueType composite glyph."""
+    glyf = font.get("glyf")
+    if not glyf or glyph_name not in glyf:
+        return False
+    g = glyf[glyph_name]
+    if not g.isComposite():
+        return False
+    idx = min(mark_idx, len(g.components) - 1)
+    c = g.components[idx]
+    c.x = int(round(getattr(c, "x", 0) + ddx))
+    c.y = int(round(getattr(c, "y", 0) + ddy))
+    return True
+
+
+def _shift_cff_component(
+    font: TTFont,
+    composition_map: dict[str, list[tuple[str, float, float]]],
+    glyph_name: str,
+    mark_idx: int,
+    ddx: float,
+    ddy: float,
+) -> bool:
+    """Update composition_map and redraw the flattened CFF outline."""
+    if glyph_name not in composition_map:
+        return False
+    comps = composition_map[glyph_name]
+    idx = min(mark_idx, len(comps) - 1)
+    name, dx, dy = comps[idx]
+    comps[idx] = (name, dx + ddx, dy + ddy)
+    adv = glyph_advance(font, comps[0][0])
+    add_composite_glyph_cff(font, glyph_name, comps, adv)
+    return True
+
+
+def _apply_adjustment(
+    font: TTFont,
+    composition_map: dict[str, list[tuple[str, float, float]]],
+    cp: int, mark_idx: int, ddx: float, ddy: float, is_cff: bool,
+) -> bool:
+    glyph_name = f"uni{cp:04X}"
+    if is_cff:
+        return _shift_cff_component(font, composition_map, glyph_name,
+                                    mark_idx, ddx, ddy)
+    return _shift_tt_component(font, glyph_name, mark_idx, int(ddx), int(ddy))
+
+
+def _append_log(log_path: Path, entry: dict) -> None:
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def run_validation_loop(
+    font: TTFont,
+    composition_map: dict[str, list[tuple[str, float, float]]],
+    composed_cps: list[int],
+    input_path: Path,
+    output_path: Path,
+    provider: str,
+    api_key: str | None,
+    model: str,
+    max_iterations: int,
+    log_path: Path,
+    is_cff: bool,
+    verbose: bool,
+) -> tuple[TTFont, str]:
+    """
+    Render composed glyphs → ask AI to validate → apply adjustments.
+    Repeats up to max_iterations times. Appends JSONL entries to log_path.
+    Returns (font, final_quality_string).
+    """
+    if not composed_cps:
+        return font, "n/a"
+
+    _append_log(log_path, {
+        "type": "run_start",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "input_font": str(input_path),
+        "output_font": str(output_path),
+        "provider": provider,
+        "model": model,
+        "composed_count": len(composed_cps),
+        "max_iterations": max_iterations,
+    })
+
+    tmp = output_path.with_suffix(".vtmp" + output_path.suffix)
+    final_quality = "unknown"
+
+    try:
+        for iteration in range(1, max_iterations + 1):
+            if verbose:
+                print(f"[validate] iteration {iteration}/{max_iterations}", file=sys.stderr)
+
+            font.save(str(tmp))
+            img_bytes = _render_chars(tmp, composed_cps)
+            result = _call_provider(provider, img_bytes, api_key, model)
+
+            quality = result.get("overall_quality", "unknown")
+            issues: list[dict] = result.get("issues") or []
+            final_quality = quality
+
+            if verbose:
+                print(f"[validate] quality={quality} issues={len(issues)}", file=sys.stderr)
+
+            adjustments: list[dict] = []
+            for iss in issues:
+                cp_str = iss.get("codepoint", "")
+                try:
+                    cp = int(cp_str.replace("U+", ""), 16)
+                except ValueError:
+                    continue
+
+                adj = iss.get("adjustment") or {}
+                direction = adj.get("direction", "")
+                mag = float(_MAGNITUDE.get(adj.get("magnitude", "small"), 20))
+                mark_idx = int(iss.get("mark_index", 1))
+
+                ddx = mag if direction == "right" else (-mag if direction == "left" else 0.0)
+                ddy = mag if direction == "up" else (-mag if direction == "down" else 0.0)
+                if ddx == 0 and ddy == 0:
+                    continue
+
+                ok = _apply_adjustment(font, composition_map, cp,
+                                       mark_idx, ddx, ddy, is_cff)
+                if ok:
+                    adjustments.append({
+                        "codepoint": cp_str, "char": iss.get("char", ""),
+                        "mark_index": mark_idx, "ddx": ddx, "ddy": ddy,
+                    })
+                    if verbose:
+                        print(
+                            f"  → {iss.get('char','')} "
+                            f"mark{mark_idx} ddx={ddx} ddy={ddy}",
+                            file=sys.stderr,
+                        )
+
+            _append_log(log_path, {
+                "type": "iteration",
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "iteration": iteration,
+                "quality": quality,
+                "issues": issues,
+                "adjustments": adjustments,
+                "notes": result.get("notes", ""),
+            })
+
+            if quality == "good" or not adjustments:
+                break
+
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+    return font, final_quality
 
 
 def check_coverage(input_path: Path) -> None:
@@ -710,6 +1145,24 @@ def main() -> int:
     p.add_argument("--donor", type=Path, help="Optional donor font for missing glyphs")
     p.add_argument("--check", action="store_true",
                    help="Only report Vietnamese coverage; don't write output")
+    p.add_argument("--font-name", metavar="NAME",
+                   help="Override the font family name in the output (avoids conflict with source)")
+    p.add_argument("--validate", action="store_true",
+                   help="Use an AI model to validate composed glyphs and adjust positioning")
+    p.add_argument("--provider", metavar="NAME", default="claude",
+                   choices=["claude", "gemini", "openrouter"],
+                   help="AI provider for validation: claude, gemini, openrouter (default: claude)")
+    p.add_argument("--api-key", metavar="KEY",
+                   help="API key for the chosen provider "
+                        "(default: $ANTHROPIC_API_KEY / $GEMINI_API_KEY / $OPENROUTER_API_KEY)")
+    p.add_argument("--validate-model", metavar="MODEL", default=None,
+                   help="Model to use for validation "
+                        "(defaults: claude-opus-4-7 / gemini-2.0-flash / "
+                        "google/gemini-2.0-flash-001)")
+    p.add_argument("--validate-iterations", metavar="N", type=int, default=3,
+                   help="Max validate→adjust iterations (default: 3)")
+    p.add_argument("--log", metavar="PATH", type=Path,
+                   help="JSONL log path for validation runs (default: <output>_viet_hoa_validate.jsonl)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -728,7 +1181,29 @@ def main() -> int:
         print(f"error: donor {args.donor} not found", file=sys.stderr)
         return 1
 
-    result = vietnamize(args.input, args.output, args.donor, args.verbose)
+    if args.validate:
+        _require_validate_deps(args.provider)
+
+    env_var = _PROVIDER_ENV.get(args.provider, "ANTHROPIC_API_KEY")
+    api_key = args.api_key or os.environ.get(env_var)
+    if args.validate and not api_key:
+        print(
+            f"error: --validate --provider {args.provider} requires an API key "
+            f"via --api-key or ${env_var}",
+            file=sys.stderr,
+        )
+        return 1
+
+    result = vietnamize(
+        args.input, args.output, args.donor, args.font_name,
+        validate=args.validate,
+        validate_provider=args.provider,
+        api_key=api_key,
+        validate_model=args.validate_model,
+        max_iterations=args.validate_iterations,
+        log_path=args.log,
+        verbose=args.verbose,
+    )
 
     print(f"Composed: {len(result['composed'])} glyph(s)")
     print(f"Imported from donor: {len(result['imported'])} glyph(s)")
@@ -736,6 +1211,8 @@ def main() -> int:
     if result["failed"]:
         print("Failed codepoints:",
               ", ".join(f"U+{cp:04X}" for cp in result["failed"]))
+    if result["validation_quality"] is not None:
+        print(f"Validation quality: {result['validation_quality']}")
     print(f"Wrote {args.output}")
     return 0
 
